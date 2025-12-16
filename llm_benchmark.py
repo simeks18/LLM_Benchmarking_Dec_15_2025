@@ -3,169 +3,193 @@ import sqlite3
 import time
 import glob
 import gc
-import argparse
+from datetime import datetime
 from llama_cpp import Llama
 
 # --- CONFIGURATION ---
 DB_FILE = "llm_benchmark.db"
-SCHEMA_FILE = "llm_benchmark_schema.sql"
-MODELS_DIR = "./models"
-N_CTX = 2048
-MAX_TOKENS = 512
-N_GPU_LAYERS = 0  # Set to 0 for CPU, 30+ for GPU
+MODELS_DIR = "./models"  # Point this to your GGUF folder
+N_CTX = 2048             # Context window
+MAX_TOKENS = 512         # Max tokens to generate
+N_GPU_LAYERS = 0         # Set to 0 for CPU only, or higher (e.g., 30) if you have a GPU
+TEMPERATURE = 0.7
 
 def init_db():
-    if not os.path.exists(SCHEMA_FILE):
-        print(f"Error: Schema file {SCHEMA_FILE} missing.")
-        return
+    """Initialize database if it doesn't exist."""
     conn = sqlite3.connect(DB_FILE)
-    with open(SCHEMA_FILE, "r") as f:
+    with open("llm_benchmark_schema.sql", "r") as f:
         conn.executescript(f.read())
     conn.close()
     print("Database initialized.")
 
-def run_benchmark(mode="all"):
-    if not os.path.exists(DB_FILE):
-        init_db()
-
-    conn = sqlite3.connect(DB_FILE)
+def get_active_prompts(conn):
+    """Fetch all active prompts."""
     cursor = conn.cursor()
+    cursor.execute("SELECT id, prompt_text FROM Prompts WHERE active = 1")
+    return cursor.fetchall()
 
-    # Prompts
-    try:
-        cursor.execute("SELECT id, prompt_text FROM Prompts WHERE active = 1")
-        prompts = cursor.fetchall()
-    except sqlite3.OperationalError:
-        print("Error: Database tables missing. Running init_db...")
-        conn.close()
-        init_db()
-        return
+def register_session(conn, description, total_models, total_prompts):
+    """Start a new session."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO Sessions (description, total_models, total_prompts, status)
+        VALUES (?, ?, ?, 'running')
+    """, (description, total_models, total_prompts))
+    conn.commit()
+    return cursor.lastrowid
 
-    if not prompts:
-        print("No active prompts found.")
-        return
-
-    # Models on disk
-    model_files = glob.glob(os.path.join(MODELS_DIR, "*.gguf"))
-    if not model_files:
-        print(f"No .gguf models found in {MODELS_DIR}")
-        return
-
-    # --- FILTER MODELS IF MODE == "new" ---
-    if mode == "new":
-        cursor.execute("SELECT DISTINCT model_id FROM Results")
-        seen_model_ids = {row[0] for row in cursor.fetchall()}
-
-        if seen_model_ids:
-            placeholders = ",".join("?" for _ in seen_model_ids)
-            cursor.execute(
-                f"SELECT filename FROM Models WHERE id IN ({placeholders})",
-                tuple(seen_model_ids)
-            )
-            seen_filenames = {row[0] for row in cursor.fetchall()}
-            model_files = [
-                m for m in model_files
-                if os.path.basename(m) not in seen_filenames
-            ]
-
-        if not model_files:
-            print("No new models to benchmark.")
-            conn.close()
-            return
-
-    # Session
-    cursor.execute(
-        "INSERT INTO Sessions (description, total_models, total_prompts) VALUES (?, ?, ?)",
-        ("Benchmark Run", len(model_files), len(prompts))
-    )
-    session_id = cursor.lastrowid
+def update_session_status(conn, session_id, status):
+    """Close a session."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE Sessions 
+        SET status = ?, end_time = CURRENT_TIMESTAMP 
+        WHERE id = ?
+    """, (status, session_id))
     conn.commit()
 
-    print(f"--- Starting Session {session_id} ({mode} mode) ---")
-
-    for model_path in model_files:
-        filename = os.path.basename(model_path)
-        print(f"Loading: {filename}...")
-
-        # Register model
-        cursor.execute(
-            "INSERT OR IGNORE INTO Models (filename, path) VALUES (?, ?)",
-            (filename, model_path)
-        )
-        cursor.execute(
-            "SELECT id, quantization FROM Models WHERE filename = ?",
-            (filename,)
-        )
-        model_id, existing_quant = cursor.fetchone()
-
+def register_model(conn, filepath):
+    """Check if model exists in DB, otherwise add it. Returns Model ID."""
+    filename = os.path.basename(filepath)
+    file_size = os.path.getsize(filepath) / (1024 * 1024) # MB
+    
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM Models WHERE filename = ?", (filename,))
+    row = cursor.fetchone()
+    
+    if row:
+        return row[0]
+    
+    # Try to guess quantization from filename (e.g., "llama-2-7b.Q4_K_M.gguf")
+    quant = "Unknown"
+    if ".Q" in filename:
         try:
-            # Load model
-            llm = Llama(
-                model_path=model_path,
+            quant = filename.split(".Q")[1].split(".")[0]
+            quant = "Q" + quant
+        except:
+            pass
+
+    cursor.execute("""
+        INSERT INTO Models (filename, path, quantization, file_size_mb)
+        VALUES (?, ?, ?, ?)
+    """, (filename, filepath, quant, file_size))
+    conn.commit()
+    return cursor.lastrowid
+
+class ModelLoader:
+    """Context manager to ensure model is LOADED then DESTROYED properly."""
+    def __init__(self, path):
+        self.path = path
+        self.llm = None
+
+    def __enter__(self):
+        print(f"  Loading model into RAM: {os.path.basename(self.path)}...")
+        try:
+            self.llm = Llama(
+                model_path=self.path,
                 n_ctx=N_CTX,
                 n_gpu_layers=N_GPU_LAYERS,
-                verbose=False
+                verbose=False # Set True for debug output
             )
-
-            # --- DETECT & STORE QUANTIZATION ---
-            if existing_quant is None:
-                quant = llm.metadata.get("general.file_type", "unknown")
-                cursor.execute(
-                    "UPDATE Models SET quantization = ? WHERE id = ?",
-                    (quant, model_id)
-                )
-                conn.commit()
-                print(f"  Quantization detected: {quant}")
-
-            # Run prompts
-            for prompt_id, prompt_text in prompts:
-                start = time.time()
-                output = llm.create_completion(
-                    prompt_text,
-                    max_tokens=MAX_TOKENS
-                )
-                duration = time.time() - start
-
-                text_out = output["choices"][0]["text"]
-                tokens = output["usage"]["completion_tokens"]
-                tps = tokens / duration if duration > 0 else 0
-
-                cursor.execute("""
-                    INSERT INTO Results (
-                        session_id,
-                        model_id,
-                        prompt_id,
-                        output_text,
-                        execution_time_seconds,
-                        tokens_per_second
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (session_id, model_id, prompt_id, text_out, duration, tps))
-                conn.commit()
-
-                print(f" > Prompt {prompt_id} done ({tps:.2f} t/s)")
-
-            del llm
-            gc.collect()
-
+            return self.llm
         except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            cursor.execute(
-                "INSERT INTO Results (session_id, model_id, error_message) VALUES (?, ?, ?)",
-                (session_id, model_id, str(e))
-            )
-            conn.commit()
+            print(f"  CRITICAL ERROR loading model: {e}")
+            return None
 
-    print("Benchmark Complete.")
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.llm:
+            print("  Unloading model and freeing RAM...")
+            del self.llm
+            self.llm = None
+            gc.collect() # Force Python garbage collector
+
+def run_benchmark():
+    # 1. Setup
+    if not os.path.exists(DB_FILE):
+        init_db()
+    
+    conn = sqlite3.connect(DB_FILE)
+    
+    # 2. Find Models
+    model_files = glob.glob(os.path.join(MODELS_DIR, "*.gguf"))
+    if not model_files:
+        print(f"No .gguf files found in {MODELS_DIR}")
+        return
+
+    # 3. Get Prompts
+    prompts = get_active_prompts(conn)
+    if not prompts:
+        print("No active prompts found in DB. Please add prompts to the 'Prompts' table.")
+        return
+
+    # 4. Create Session
+    session_id = register_session(conn, "Benchmark Run", len(model_files), len(prompts))
+    print(f"Session {session_id} started. Found {len(model_files)} models and {len(prompts)} prompts.")
+
+    # 5. Main Loop
+    for i, model_path in enumerate(model_files):
+        model_id = register_model(conn, model_path)
+        model_name = os.path.basename(model_path)
+        print(f"\n[{i+1}/{len(model_files)}] Processing {model_name}...")
+
+        # --- CRITICAL: LOAD / RUN / UNLOAD CYCLE ---
+        with ModelLoader(model_path) as llm:
+            if llm is None:
+                # Log model failure
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO Results (session_id, model_id, error_message)
+                    VALUES (?, ?, ?)
+                """, (session_id, model_id, "Failed to load model file"))
+                conn.commit()
+                continue
+
+            # Run all prompts for this model
+            for p_idx, (prompt_id, prompt_text) in enumerate(prompts):
+                print(f"    Prompt {p_idx+1}/{len(prompts)}...", end="\r")
+                
+                start_time = time.time()
+                try:
+                    # Run Inference
+                    output = llm.create_completion(
+                        prompt_text, 
+                        max_tokens=MAX_TOKENS, 
+                        temperature=TEMPERATURE
+                    )
+                    
+                    end_time = time.time()
+                    duration = end_time - start_time
+                    
+                    text_out = output['choices'][0]['text']
+                    tokens = output['usage']['completion_tokens']
+                    tps = tokens / duration if duration > 0 else 0
+
+                    # Save Result
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO Results 
+                        (session_id, model_id, prompt_id, output_text, execution_time_seconds, tokens_generated, tokens_per_second)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (session_id, model_id, prompt_id, text_out, duration, tokens, tps))
+                    conn.commit()
+
+                except Exception as e:
+                    print(f"\n    Error on prompt {prompt_id}: {e}")
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO Results (session_id, model_id, prompt_id, error_message)
+                        VALUES (?, ?, ?, ?)
+                    """, (session_id, model_id, prompt_id, str(e)))
+                    conn.commit()
+
+        # Update progress in Session table
+        cursor = conn.cursor()
+        cursor.execute("UPDATE Sessions SET models_completed = models_completed + 1 WHERE id = ?", (session_id,))
+        conn.commit()
+    
+    update_session_status(conn, session_id, "completed")
+    print(f"\nBenchmark Session {session_id} Complete!")
     conn.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode",
-        choices=["all", "new"],
-        default="all",
-        help="Run all models or only new models"
-    )
-    args = parser.parse_args()
-    run_benchmark(args.mode)
+    run_benchmark()
