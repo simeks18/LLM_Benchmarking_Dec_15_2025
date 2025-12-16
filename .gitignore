@@ -1,0 +1,14 @@
+# Ignore huge model files
+models/*.gguf
+models/*.bin
+
+# Ignore local database and results
+*.db
+*.csv
+
+# Ignore python cache
+__pycache__/
+*.pyc
+
+# Ignore system files
+.DS_Store
