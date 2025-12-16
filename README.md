@@ -15,13 +15,13 @@ Add Models: Place .gguf files in the models/ directory.
 
 Add Prompts: Create a text file (e.g., prompts.txt) and run:
 
-Bash
+'''Bash
 
 python import_prompts.py prompts.txt
 Usage
 Run the benchmark:
 
-Bash
+'''Bash
 
 python llm_benchmark.py
 Results
